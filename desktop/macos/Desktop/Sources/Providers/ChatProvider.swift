@@ -715,6 +715,7 @@ struct ChatMessage: Identifiable {
   /// Kernel journal lifecycle when this message was projected from a journal
   /// row. Failed turns get a light visual treatment so they don't look completed.
   var journalStatus: KernelJournalTurnStatus?
+  var failureCode: AgentRuntimeFailureCode? = nil
   /// A journal-first continuation can reserve its assistant row before the
   /// query begins. It stays out of the transcript until real output arrives.
   var hidesEmptyStreamingPlaceholder: Bool
@@ -1314,7 +1315,7 @@ class ChatProvider: ObservableObject {
   var messageRatingWriteChain: [String: Task<Void, Never>] = [:]
   var persistMessageRatingHandler: ((String, Int?) async throws -> Void)?
   private var journalTerminalTargets = ChatTerminalTargetRegistry<ChatJournalTerminalTarget>()
-  private var agentBridgeStarted = false
+  var agentBridgeStarted = false
   /// The root shell supplies one server-authoritative sample before this
   /// provider resolves Main Chat. This is process-local only: a different
   /// owner, a failed sample, and every non-main surface receive no extension.
@@ -1414,6 +1415,7 @@ class ChatProvider: ObservableObject {
   private var runtimeOwnerObserver: AnyCancellable?
   private var signOutObserver: AnyCancellable?
   private var sessionInvalidateObserver: AnyCancellable?
+  var authSessionNotificationChain: Task<Void, Never>?
 
   private var refreshAllObserver: AnyCancellable?
   private var userSkillsObserver: AnyCancellable?
@@ -1574,28 +1576,14 @@ class ChatProvider: ObservableObject {
         Task { @MainActor in
           guard let self = self else { return }
           log("ChatProvider: userDidSignOut — clearing chat state so the next user gets fresh context")
-          if self.agentBridgeStarted {
-            await self.resolvedAgentClient().stop()
-            self.agentBridgeStarted = false
-          }
+          await self.stopAgentBridgeIfStarted()
           self.resetSessionStateForAuthChange()
           self.resetDraftAfterSignOut()
           AgentRuntimeStatusStore.shared.reset()
         }
       }
 
-    // Light session invalidation (expired creds) — stop bridge only; preserve chat draft/state.
-    sessionInvalidateObserver = NotificationCenter.default.publisher(for: .sessionDidInvalidate)
-      .sink { [weak self] _ in
-        Task { @MainActor in
-          guard let self else { return }
-          log("ChatProvider: sessionDidInvalidate — stopping agent bridge")
-          if self.agentBridgeStarted {
-            await self.resolvedAgentClient().stop()
-            self.agentBridgeStarted = false
-          }
-        }
-      }
+    sessionInvalidateObserver = makeAuthSessionNotificationObserver()
 
     // Cmd+R: refresh messages on demand
     refreshAllObserver = NotificationCenter.default.publisher(for: .refreshAllData)
@@ -3655,9 +3643,20 @@ class ChatProvider: ObservableObject {
 
   // MARK: - Kernel Journal Refresh
 
+  func stopAgentBridgeIfStarted() async {
+    guard agentBridgeStarted else { return }
+    await resolvedAgentClient().stop()
+    agentBridgeStarted = false
+  }
+
+  func stopAgentBridgeAfterSessionInvalidation() async {
+    log("ChatProvider: sessionDidInvalidate — stopping agent bridge")
+    await stopAgentBridgeIfStarted()
+  }
+
   /// Activation/notification is only a wakeup. Ordered range replay in
   /// KernelTurnProjection is the sole source of new or updated messages.
-  private func refreshJournalProjection() async {
+  func refreshJournalProjection() async {
     guard await ensureBridgeStartedForKernel() else { return }
     await kernelTurnProjection.refresh(surface: mainChatSurfaceReference())
   }
@@ -6270,6 +6269,7 @@ class ChatProvider: ObservableObject {
     fallbackAssistantMessage: ChatMessage? = nil
   ) -> ChatMessage? {
     if let index = messages.firstIndex(where: { $0.id == messageID }) {
+      messages[index].failureCode = notice.failureCode
       messages[index].text = notice.transcriptContent(partialText: messages[index].text)
       messages[index].isStreaming = false
       messages[index].journalStatus = .failed
@@ -6285,6 +6285,7 @@ class ChatProvider: ObservableObject {
       fallback.id == messageID,
       fallback.sender == .ai
     else { return nil }
+    fallback.failureCode = notice.failureCode
     fallback.text = notice.transcriptContent(partialText: fallback.text)
     fallback.isStreaming = false
     fallback.journalStatus = .failed
